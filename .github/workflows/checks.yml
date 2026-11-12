@@ -1,0 +1,35 @@
+name: Project checks
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+      - name: Install dependencies
+        run: |
+          for directory in backend backend/gateway backend/services/auth backend/services/chat backend/services/agent backend/services/billing frontend; do
+            (cd "$directory" && npm ci --no-audit --no-fund)
+          done
+      - run: node deployment/validate.mjs
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'cfn-lint>=1,<2'
+      - name: Validate AWS templates
+        run: |
+          node deployment/aws/generate-templates.mjs
+          cfn-lint deployment/aws/bootstrap.json deployment/aws/stack.json

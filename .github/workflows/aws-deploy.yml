@@ -1,0 +1,105 @@
+name: Deploy AgentVerse to AWS
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+  PROJECT_NAME: ${{ vars.AWS_PROJECT_NAME || 'agentverse' }}
+
+jobs:
+  validate:
+    uses: ./.github/workflows/checks.yml
+
+  publish-images:
+    needs: validate
+    if: vars.AWS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth, chat, agent, billing, gateway]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build and publish immutable image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SERVICE: ${{ matrix.service }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # A rerun can reuse an immutable image already pushed for this commit.
+          if aws ecr describe-images --repository-name "$PROJECT_NAME-$SERVICE" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image already published"
+            exit 0
+          fi
+          if [ "$SERVICE" = gateway ]; then
+            DOCKERFILE=backend/gateway/Dockerfile
+          else
+            DOCKERFILE="backend/services/$SERVICE/Dockerfile"
+          fi
+          docker build --platform linux/amd64 -f "$DOCKERFILE" -t "$REGISTRY/$PROJECT_NAME-$SERVICE:$IMAGE_TAG" backend
+          docker push "$REGISTRY/$PROJECT_NAME-$SERVICE:$IMAGE_TAG"
+
+  deploy:
+    needs: publish-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy backend and wait for health
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: python3 deployment/aws/deploy-backend.py --project "$PROJECT_NAME" --region "$AWS_REGION" --tag "$IMAGE_TAG"
+      - name: Read infrastructure outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "$PROJECT_NAME-app" --query 'Stacks[0].Outputs' --output json > /tmp/agentverse-outputs.json
+          python3 - <<'PY'
+          import json, os
+          outputs = {item['OutputKey']: item['OutputValue'] for item in json.load(open('/tmp/agentverse-outputs.json'))}
+          with open(os.environ['GITHUB_ENV'], 'a') as file:
+              for name in ['FrontendUrl', 'FrontendBucketName', 'DistributionId']:
+                  file.write(f'{name}={outputs[name]}\n')
+          PY
+      - name: Build frontend with public runtime settings
+        working-directory: frontend
+        env:
+          VITE_SERVER_URL: ${{ env.FrontendUrl }}
+          VITE_FIREBASE_API_KEY: ${{ vars.VITE_FIREBASE_API_KEY }}
+          VITE_FIREBASE_AUTH_DOMAIN: ${{ vars.VITE_FIREBASE_AUTH_DOMAIN }}
+          VITE_FIREBASE_PROJECT_ID: ${{ vars.VITE_FIREBASE_PROJECT_ID }}
+          VITE_FIREBASE_STORAGE_BUCKET: ${{ vars.VITE_FIREBASE_STORAGE_BUCKET }}
+          VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ vars.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+          VITE_FIREBASE_APP_ID: ${{ vars.VITE_FIREBASE_APP_ID }}
+          VITE_RAZORPAY_KEY_ID: ${{ vars.VITE_RAZORPAY_KEY_ID }}
+        run: |
+          node -e 'for(const k of ["VITE_FIREBASE_API_KEY","VITE_FIREBASE_PROJECT_ID","VITE_FIREBASE_APP_ID","VITE_RAZORPAY_KEY_ID"]){if(!process.env[k])throw Error("Missing GitHub variable "+k)}'
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Publish frontend and invalidate cache
+        run: |
+          aws s3 sync frontend/dist "s3://$FrontendBucketName" --delete
+          aws cloudfront create-invalidation --distribution-id "$DistributionId" --paths '/*'
+      - name: Check public API health
+        run: curl --fail --retry 6 --retry-delay 10 "$FrontendUrl/api/health"
