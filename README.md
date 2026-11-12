@@ -1,4 +1,4 @@
-﻿# AgentVerse AI
+# AgentVerse AI
 
 A multi-agent AI workspace for conversations, coding, web research, document understanding, image generation, and presentations. A React interface connects to five Node.js services, with LangGraph routing requests to specialized agents.
 
@@ -8,9 +8,7 @@ A multi-agent AI workspace for conversations, coding, web research, document und
 
 The interface includes a conversation sidebar, Google sign-in, file attachments, credit balance, and Auto, Chat, Coding, PDF, PPT, Vision, and Search modes.
 
-<!-- Save the supplied screenshot as docs/images/agentverse-ai.png, then uncomment:
 ![AgentVerse AI chat workspace](docs/images/agentverse-ai.png)
--->
 
 ## Features
 
